@@ -2,18 +2,37 @@
 # pip install git+https://github.com/openai/whisper.git    # large download
 # pip install torch # for whispers backend
 
-import torch
-print(torch.cuda.is_available())
+# pip install yt-dlp # need to replace pytube
 
+import torch
+# print(torch.cuda.is_available())
+# print(torch.version.cuda)             # Shows the version PyTorch was built with
+# print(torch.backends.cudnn.version()) # Shows cuDNN version if available
+# print(torch.cuda.device_count())      # Should be > 0 if working
+# print(torch.cuda.get_device_name(0))  # Name of your GPU
+
+import yt_dlp
 import whisper
-from pytube import YouTube
+# from pytube import YouTube
 import os
 
-def download_youtube_audio(url, output_path="audio.mp4"):
-    yt = YouTube(url)
-    audio_stream = yt.streams.filter(only_audio=True).first()
-    print(f"downloading audio: {yt.title}")
-    audio_stream.download(filename=output_path)
+def download_youtube_audio(url, output_path="audio.mp3"):
+    ydl_opts = {
+        'ffmpeg_location': '/usr/bin',
+        'format': 'bestaudio/best',
+        'outtmpl': output_path,
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '192',
+        }],
+        'quiet': True,
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        print(f"downloading audio from: {url}")
+        ydl.download([url])
+
     return output_path
 
 
@@ -27,7 +46,7 @@ def transcribe_audio(audio_path):
 
 def main():
     url = input("Enter youtube url: ")
-    audio_file = "audio.mp4"
+    audio_file = "audio.mp3"
     
     # step 1 download audio
     download_youtube_audio(url, audio_file)
