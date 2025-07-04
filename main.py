@@ -16,24 +16,45 @@ import whisper
 # from pytube import YouTube
 import os
 
-def download_youtube_audio(url, output_path="audio.mp3"):
+
+def download_youtube_audio(url):
+
+    # show what file was created
+    print("Files in current directory:", os.listdir("."))
     ydl_opts = {
-        'ffmpeg_location': '/usr/bin',
+        # 'ffmpeg_location': '/usr/bin',
         'format': 'bestaudio/best',
-        'outtmpl': output_path,
+        'outtmpl': '%(title)s.%(ext)s',
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
             'preferredquality': '192',
         }],
-        'quiet': True,
+        'quiet': True, # False to disable output to debug
+        'keepvideo': False, # force overwrite and log errors
+        'noprogress': False,
+        'outtmpl': '%(title)s.%(ext)s', # dynamic naming
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         print(f"downloading audio from: {url}")
-        ydl.download([url])
+        # extract dynamically
+        info = ydl.extract_info(url, download=True)
+        output_filename = ydl.prepare_filename(info).replace('.webm', '.mp3').replace('.m4a', '.mp3')
+        # old
+        # ydl.download([url])
 
-    return output_path
+    # show what file was created
+    print("Files in current directory:", os.listdir("."))
+
+    # error handling#
+    print(f"Audio file saved as: {output_filename}")
+    if not os.path.exists(output_filename):
+        raise FileNotFoundError(f"{output_filename} was not created. yt-dlp may have failed.")
+
+    print(f"Downloading audio from: {url}")
+
+    return output_filename
 
 
 def transcribe_audio(audio_path):
@@ -46,10 +67,12 @@ def transcribe_audio(audio_path):
 
 def main():
     url = input("Enter youtube url: ")
-    audio_file = "audio.mp3"
-    
+
     # step 1 download audio
-    download_youtube_audio(url, audio_file)
+    audio_file = download_youtube_audio(url)
+
+    # show what file was created
+    print("Files in current directory:", os.listdir("."))
 
     # step 2 transcribe
     transcript = transcribe_audio(audio_file)
