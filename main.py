@@ -12,6 +12,11 @@ import argparse
 import torch
 import yt_dlp
 import whisper
+# structured, domain-agnostic summarizer (Markdown + JSON)
+from generic_transcript_summarizer import (
+    summarize_text as structured_summarize_text,
+    SummarizerConfig as StructuredSummarizerConfig,
+)
 
 # -----------------------------
 # YouTube download
@@ -49,6 +54,7 @@ def download_youtube_audio(url: str) -> str:
 # -----------------------------
 
 def transcribe_audio(audio_path: str, use_gpu: bool = True, model_size: str = "base") -> str:
+    print(use_gpu)
     """Transcribe audio using OpenAI Whisper."""
     device = "cuda" if use_gpu and torch.cuda.is_available() else "cpu"
     print(f"[INFO] Loading Whisper model '{model_size}' on device: {device}")
@@ -209,6 +215,18 @@ def parse_args():
     parser.add_argument("--summary-mode", type=str, choices=["auto", "abstractive", "extractive"], default="auto",
                         help="Summary mode: auto (try transformers), abstractive, or extractive")
     parser.add_argument("--summary-words", type=int, default=200, help="Target words for the summary (approximate)")
+    # Structured summary (generic, Markdown + JSON)
+    parser.add_argument("--structured", action="store_true", help="Generate a structured Markdown+JSON summary (generic_transcript_summarizer).")
+    parser.add_argument("--structured-md", type=str, default="summary.md", help="Output path for structured Markdown summary (default: summary.md)")
+    parser.add_argument("--structured-json", type=str, default="summary.json", help="Output path for structured JSON summary (default: summary.json)")
+    parser.add_argument("--tldr-sentences", type=int, default=1, help="Structured summary: number of TL;DR sentences (1–2 typical).")
+    parser.add_argument("--core-points", type=int, default=5, help="Structured summary: number of 'Core Points' bullets.")
+    parser.add_argument("--themes", type=int, default=6, help="Structured summary: number of 'Themes' bullets.")
+    parser.add_argument("--cause-effect", type=int, default=5, help="Structured summary: number of cause→effect pairs.")
+    parser.add_argument("--takeaways", type=int, default=5, help="Structured summary: number of actionable takeaways.")
+    parser.add_argument("--key-phrases", type=int, default=10, help="Structured summary: number of key phrases.")
+    parser.add_argument("--open-questions", type=int, default=3, help="Structured summary: number of open questions.")
+
     return parser.parse_args()
 
 def main():
@@ -233,6 +251,24 @@ def main():
             target_words=args.summary_words
         )
         save_text(summary, args.summary_output)
+
+    # Step 4b: Optional structured (generic) summary → Markdown + JSON
+    if args.structured:
+        print("[INFO] Generating structured (generic) summary...")
+        cfg = StructuredSummarizerConfig(
+            tldr_sentences=max(1, min(2, args.tldr_sentences)),
+            core_points=max(3, args.core_points),
+            themes=max(3, args.themes),
+            cause_effect_pairs=max(0, args.cause_effect),
+            takeaways=max(0, args.takeaways),
+            key_phrases=max(0, args.key_phrases),
+            open_questions=max(0, args.open_questions),
+        )
+        structured = structured_summarize_text(transcript, config=cfg)
+        # Write Markdown
+        save_text(structured.to_markdown(), args.structured_md)
+        # Write JSON
+        save_text(structured.to_json(), args.structured_json)
 
     # Step 5: Cleanup
     if not args.no_cleanup:
