@@ -2,28 +2,66 @@
 # pip install git+https://github.com/openai/whisper.git    # large download
 # pip install torch  # use the CUDA build if you want GPU acceleration
 # pip install yt-dlp # robust YouTube downloader
+# pip install librosa transformers tqdm
 # sudo apt install ffmpeg
-# Optional (for abstractive summaries on GPU/CPU):
-#   pip install transformers sentencepiece
 
+import time
 import os
 import re
 import argparse
+import math
 import torch
 import yt_dlp
 import whisper
-# structured, domain-agnostic summarizer (Markdown + JSON)
+import librosa  # audio loading
+from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
 from generic_transcript_summarizer import (
     summarize_text as structured_summarize_text,
     SummarizerConfig as StructuredSummarizerConfig,
 )
+
+# optional: tqdm progress bar, but keep a fallback so script still runs
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover
+    def tqdm(iterable, *args, **kwargs):
+        return iterable
 
 # -----------------------------
 # YouTube download
 # -----------------------------
 
 def download_youtube_audio(url: str) -> str:
-    """Download audio from YouTube and convert to mp3 using yt-dlp."""
+    """Download audio from YouTube and convert to mp3 using yt-dlp, with a tqdm progress bar."""
+    from tqdm import tqdm
+
+    pbar = {"bar": None}
+
+    def progress_hook(d):
+        status = d.get("status")
+        if status == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate")
+            downloaded = d.get("downloaded_bytes", 0)
+
+            if total:
+                # create bar on first update
+                if pbar["bar"] is None:
+                    pbar["bar"] = tqdm(
+                        total=total,
+                        unit="B",
+                        unit_scale=True,
+                        unit_divisor=1024,
+                        desc="Downloading audio",
+                    )
+                pbar["bar"].n = downloaded
+                pbar["bar"].refresh()
+
+        elif status == "finished":
+            # download finished, close bar
+            if pbar["bar"] is not None:
+                pbar["bar"].n = pbar["bar"].total or pbar["bar"].n
+                pbar["bar"].close()
+
     ydl_opts = {
         'format': 'bestaudio/best',
         'outtmpl': '%(title)s.%(ext)s',
@@ -34,11 +72,13 @@ def download_youtube_audio(url: str) -> str:
         }],
         'quiet': True,
         'keepvideo': False,
-        'noprogress': False,
+        "progress_hooks": [progress_hook],
+        'noprogress': True,
     }
 
+    print(f"[INFO] Downloading audio from: {url}")
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        print(f"[INFO] Downloading audio from: {url}")
+        # print(f"[INFO] Downloading audio from: {url}")
         info = ydl.extract_info(url, download=True)
         downloaded = ydl.prepare_filename(info)  # e.g. "...webm" or "...m4a" before postprocess
         audio_filename = os.path.splitext(downloaded)[0] + ".mp3"
@@ -50,19 +90,158 @@ def download_youtube_audio(url: str) -> str:
     return audio_filename
 
 # -----------------------------
-# Transcription
+# Irish-specific ASR (wav2vec2)
 # -----------------------------
 
-def transcribe_audio(audio_path: str, use_gpu: bool = True, model_size: str = "base") -> str:
-    print(use_gpu)
-    """Transcribe audio using OpenAI Whisper."""
+IRISH_ASR_MODEL_ID = "Aditya3107/wav2vec2-large-xls-r-1b-ga-ie"
+
+_irish_asr_model = None
+_irish_asr_processor = None
+
+
+# -----------------------------
+# Irish-specific ASR (wav2vec2)
+# -----------------------------
+
+IRISH_ASR_MODEL_ID = "Aditya3107/wav2vec2-large-xls-r-1b-ga-ie"
+
+_irish_asr_model = None
+_irish_asr_processor = None
+
+
+def load_irish_asr(device: str):
+    """
+    Lazy-load the Irish wav2vec2 model + processor on the given device.
+    """
+    global _irish_asr_model, _irish_asr_processor
+    if _irish_asr_model is None or _irish_asr_processor is None:
+        print(f"[INFO] Loading Irish ASR model '{IRISH_ASR_MODEL_ID}' on {device}")
+        processor = Wav2Vec2Processor.from_pretrained(IRISH_ASR_MODEL_ID)
+        model = Wav2Vec2ForCTC.from_pretrained(IRISH_ASR_MODEL_ID)
+        model.to(device)
+        model.eval()
+        _irish_asr_model = model
+        _irish_asr_processor = processor
+    return _irish_asr_model, _irish_asr_processor
+
+
+def transcribe_irish_wav2vec2(audio_path: str, device: str = "cpu") -> str:
+    """
+    High-accuracy Irish transcription using wav2vec2, with chunking so it fits in GPU RAM.
+
+    - Uses smaller chunks on GPU to avoid OOM.
+    - Uses a small overlap between chunks to reduce word-cutting at boundaries.
+    - Drops a few words at the start of each chunk (except the first) to avoid repeats.
+    """
+    import numpy as np
+
+    model, processor = load_irish_asr(device)
+
+    # 1) Load audio as mono 16kHz
+    target_sr = 16_000
+    audio, sr = librosa.load(audio_path, sr=target_sr, mono=True)
+
+    # 2) Chunk setup
+    if device == "cuda":
+        chunk_duration_s = 8   # shorter on GPU
+    else:
+        chunk_duration_s = 15  # a bit longer on CPU
+
+    chunk_size = int(chunk_duration_s * target_sr)
+
+    overlap_s = 0.5           # half-second overlap
+    overlap = int(overlap_s * target_sr)
+
+    # step = how far we move between chunks
+    step = chunk_size - overlap
+    if step <= 0:
+        step = chunk_size
+
+    min_chunk_samples = 4000  # ~0.25s; skip ultra-short tails
+
+    n_samples = len(audio)
+    total_chunks = math.ceil(n_samples / step)
+    print(f"[INFO] Irish ASR: {n_samples} samples at {target_sr} Hz (~{n_samples/target_sr:.1f}s, ~{total_chunks} chunks)")
+
+    texts: list[str] = []
+
+    for idx, start in enumerate(
+        tqdm(range(0, n_samples, step), total=total_chunks, desc="Irish ASR chunks")
+    ):
+        end = min(start + chunk_size, n_samples)
+        chunk = audio[start:end]
+
+        # Skip ultra-short trailing fragments that break conv1d
+        if len(chunk) < min_chunk_samples:
+            continue
+
+        chunk = np.asarray(chunk, dtype="float32")
+
+        inputs = processor(
+            chunk,
+            sampling_rate=target_sr,
+            return_tensors="pt",
+            padding=True,
+        )
+
+        input_values = inputs.input_values.to(device)
+        attention_mask = inputs.attention_mask.to(device) if "attention_mask" in inputs else None
+
+        with torch.no_grad():
+            if device == "cuda":
+                # NEW: use the recommended amp API to avoid the FutureWarning
+                with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+                    logits = model(input_values, attention_mask=attention_mask).logits
+            else:
+                logits = model(input_values, attention_mask=attention_mask).logits
+
+        pred_ids = torch.argmax(logits, dim=-1)
+        text = processor.batch_decode(pred_ids)[0].strip()
+
+        # Simple de-duplication for overlap:
+        # drop a few leading words on all chunks except the first
+        words = text.split()
+        if idx > 0 and len(words) > 4:
+            words = words[3:]
+        cleaned = " ".join(words)
+        texts.append(cleaned)
+
+        if device == "cuda":
+            torch.cuda.empty_cache()
+
+    return " ".join(texts)
+
+
+
+def transcribe_audio(
+    audio_path: str,
+    use_gpu: bool = True,
+    model_size: str = "base",
+    language: str | None = None,
+) -> str:
+    """Transcribe audio using Whisper or Irish wav2vec2 depending on language."""
     device = "cuda" if use_gpu and torch.cuda.is_available() else "cpu"
+    print(f"[DEBUG] use_gpu={use_gpu}, device={device}")
+
+    lang = (language or "").strip().lower()
+
+    # If the user explicitly asked for Irish ("ga" / "ga-ie"), use wav2vec2.
+    if lang.startswith("ga"):
+        print("[INFO] Using Irish ASR model (wav2vec2) instead of Whisper")
+        return transcribe_irish_wav2vec2(audio_path, device=device)
+
+    # Otherwise fall back to Whisper (auto language or forced language)
     print(f"[INFO] Loading Whisper model '{model_size}' on device: {device}")
     model = whisper.load_model(model_size, device=device)
 
-    print("[INFO] Transcribing...")
-    result = model.transcribe(audio_path)
+    kwargs = {"task": "transcribe"}
+    if language is not None and lang != "auto":
+        kwargs["language"] = language  # e.g. "en", "es", etc.
+
+    print("[INFO] Transcribing with Whisper...")
+    result = model.transcribe(audio_path, **kwargs)
     return result["text"]
+
 
 # -----------------------------
 # Summarization
@@ -226,17 +405,31 @@ def parse_args():
     parser.add_argument("--takeaways", type=int, default=5, help="Structured summary: number of actionable takeaways.")
     parser.add_argument("--key-phrases", type=int, default=10, help="Structured summary: number of key phrases.")
     parser.add_argument("--open-questions", type=int, default=3, help="Structured summary: number of open questions.")
+    parser.add_argument("--language", type=str, default="auto", help="Language code/name for Whisper (e.g. 'en', 'Spanish', or 'auto' for detection)")
 
     return parser.parse_args()
 
 def main():
+    start = time.time()  # ⏱️ START TIMER
     args = parse_args()
 
     # Step 1: Download audio
+    t0 = time.time()
     audio_file = download_youtube_audio(args.url)
+    t1 = time.time()
+    print(f"[PERF] Download time: {t1 - t0:.1f} sec")
 
     # Step 2: Transcribe
-    transcript = transcribe_audio(audio_file, use_gpu=not args.cpu, model_size=args.model)
+    lang = None if args.language.lower() == "auto" else args.language
+    t2 = time.time()
+    transcript = transcribe_audio(
+        audio_file,
+        use_gpu=not args.cpu,
+        model_size=args.model,
+        language=lang,
+    )
+    t3 = time.time()
+    print(f"[PERF] Transcription time: {t3 - t2:.1f} sec")
 
     # Step 3: Save transcript
     save_text(transcript, args.output)
@@ -244,6 +437,7 @@ def main():
     # Step 4: Optional summarization
     if args.summarize:
         print("[INFO] Generating summary...")
+        t4 = time.time()
         summary = summarize_text(
             transcript,
             use_gpu=not args.cpu,
@@ -251,6 +445,8 @@ def main():
             target_words=args.summary_words
         )
         save_text(summary, args.summary_output)
+        t5 = time.time()
+        print(f"[PERF] Summary time: {t5 - t4:.1f} sec")
 
     # Step 4b: Optional structured (generic) summary → Markdown + JSON
     if args.structured:
@@ -277,6 +473,15 @@ def main():
             print(f"[INFO] Deleted temporary file: {audio_file}")
         except OSError as e:
             print(f"[WARN] Could not delete {audio_file}: {e}")
+
+    end = time.time()  # ⏱️ END TIMER
+    duration = end - start
+
+    # 🟢 Print nice human readable timing
+    mins = duration // 60
+    secs = duration % 60
+
+    print(f"\n[PERF] Total runtime: {mins:.0f} min {secs:.1f} sec")
 
 if __name__ == "__main__":
     main()
