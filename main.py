@@ -19,6 +19,7 @@ from generic_transcript_summarizer import (
     summarize_text as structured_summarize_text,
     SummarizerConfig as StructuredSummarizerConfig,
 )
+from irish_postprocess import postprocess_irish_transcript
 
 # optional: tqdm progress bar, but keep a fallback so script still runs
 try:
@@ -228,7 +229,11 @@ def transcribe_audio(
     # If the user explicitly asked for Irish ("ga" / "ga-ie"), use wav2vec2.
     if lang.startswith("ga"):
         print("[INFO] Using Irish ASR model (wav2vec2) instead of Whisper")
-        return transcribe_irish_wav2vec2(audio_path, device=device)
+        raw = transcribe_irish_wav2vec2(audio_path, device=device)
+        print("[DEBUG] Irish raw (first 120):", raw[:120])
+        clean = postprocess_irish_transcript(raw)
+        print("[DEBUG] Irish clean (first 120):", clean[:120])
+        return clean
 
     # Otherwise fall back to Whisper (auto language or forced language)
     print(f"[INFO] Loading Whisper model '{model_size}' on device: {device}")
