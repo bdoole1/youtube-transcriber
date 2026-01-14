@@ -382,18 +382,29 @@ def save_text(text: str, filename: str):
 # -----------------------------
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="YouTube Whisper Transcript Tool")
-    parser.add_argument("url", help="YouTube video URL")
+    parser = argparse.ArgumentParser(description="YouTube/Local Audio Transcript Tool")
+
+    # Input: either YouTube URL (positional) OR local file (--audio)
+    parser.add_argument("url", nargs="?", default=None, help="YouTube video URL (optional if --audio is used)")
+    parser.add_argument("--audio", type=str, default=None, help="Path to a local audio file (mp3/wav/m4a/etc.)")
+
     parser.add_argument("--cpu", action="store_true", help="Force transcription to run on CPU")
     parser.add_argument("--no-cleanup", action="store_true", help="Keep downloaded audio file")
     parser.add_argument("--output", type=str, default="transcript.txt", help="Transcript output file")
     parser.add_argument("--model", type=str, default="base", help="Whisper model size (tiny, base, small, medium, large)")
+
     # Summarization
     parser.add_argument("--summarize", action="store_true", help="Also generate a summary from the transcript")
     parser.add_argument("--summary-output", type=str, default="summary.txt", help="Summary output file")
-    parser.add_argument("--summary-mode", type=str, choices=["auto", "abstractive", "extractive"], default="auto",
-                        help="Summary mode: auto (try transformers), abstractive, or extractive")
+    parser.add_argument(
+        "--summary-mode",
+        type=str,
+        choices=["auto", "abstractive", "extractive"],
+        default="auto",
+        help="Summary mode: auto (try transformers), abstractive, or extractive",
+    )
     parser.add_argument("--summary-words", type=int, default=200, help="Target words for the summary (approximate)")
+
     # Structured summary (generic, Markdown + JSON)
     parser.add_argument("--structured", action="store_true", help="Generate a structured Markdown+JSON summary (generic_transcript_summarizer).")
     parser.add_argument("--structured-md", type=str, default="summary.md", help="Output path for structured Markdown summary (default: summary.md)")
@@ -405,19 +416,38 @@ def parse_args():
     parser.add_argument("--takeaways", type=int, default=5, help="Structured summary: number of actionable takeaways.")
     parser.add_argument("--key-phrases", type=int, default=10, help="Structured summary: number of key phrases.")
     parser.add_argument("--open-questions", type=int, default=3, help="Structured summary: number of open questions.")
-    parser.add_argument("--language", type=str, default="auto", help="Language code/name for Whisper (e.g. 'en', 'Spanish', or 'auto' for detection)")
 
-    return parser.parse_args()
+    parser.add_argument("--language", type=str, default="auto", help="Language code/name for Whisper (e.g. 'en', 'Spanish', 'auto', 'ga')")
+
+    args = parser.parse_args()
+
+    # Validate: exactly one input method
+    if (args.url is None and args.audio is None) or (args.url is not None and args.audio is not None):
+        parser.error("Provide either a YouTube URL OR --audio <path>, but not both.")
+
+    # If audio path provided, validate it exists
+    if args.audio is not None and not os.path.isfile(args.audio):
+        parser.error(f"--audio file not found: {args.audio}")
+
+    return args
+
 
 def main():
     start = time.time()  # ⏱️ START TIMER
     args = parse_args()
 
-    # Step 1: Download audio
-    t0 = time.time()
-    audio_file = download_youtube_audio(args.url)
-    t1 = time.time()
-    print(f"[PERF] Download time: {t1 - t0:.1f} sec")
+    downloaded_temp = False
+
+    # Step 1: Get audio file (from YouTube OR local path)
+    if args.audio:
+        audio_file = args.audio
+        print(f"[INFO] Using local audio file: {audio_file}")
+    else:
+        t0 = time.time()
+        audio_file = download_youtube_audio(args.url)
+        t1 = time.time()
+        print(f"[PERF] Download time: {t1 - t0:.1f} sec")
+        downloaded_temp = True
 
     # Step 2: Transcribe
     lang = None if args.language.lower() == "auto" else args.language
@@ -466,8 +496,8 @@ def main():
         # Write JSON
         save_text(structured.to_json(), args.structured_json)
 
-    # Step 5: Cleanup
-    if not args.no_cleanup:
+    # Step 5: Cleanup ONLY if we downloaded a temp file
+    if downloaded_temp and not args.no_cleanup:
         try:
             os.remove(audio_file)
             print(f"[INFO] Deleted temporary file: {audio_file}")
